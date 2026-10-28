@@ -1,0 +1,841 @@
+// Suroskie Creative Performance Portal — relational schema.
+// Conventions:
+//  * Meta object IDs are stored as strings exactly as returned by the Graph API.
+//  * Monetary values are Decimal (never float). Currency is stored per insight row.
+//  * Nullable metric columns mean "Meta did not return this metric" (unavailable / not applicable),
+//    which is different from 0.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Auth (Better Auth core tables) ─────────────────────────────
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+}
+
+model User {
+  id            String     @id
+  name          String
+  email         String     @unique
+  emailVerified Boolean    @default(false)
+  image         String?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  status        UserStatus @default(INVITED)
+  lastLoginAt   DateTime?
+  suspendedAt   DateTime?
+
+  // Per-user data-scope overrides. NULL = inherit from the user's roles.
+  allAdAccounts    Boolean?
+  allCreators      Boolean?
+  maxLookbackDays  Int?
+  // Users may never see data dated before this (inclusive lower bound), regardless of role.
+  earliestDataDate DateTime? @db.Date
+
+  sessions            Session[]
+  accounts            Account[]
+  roles               UserRole[]
+  permissionOverrides UserPermissionOverride[]
+  metricOverrides     UserMetricOverride[]
+  adAccountAccess     UserAdAccountAccess[]
+  creatorAccess       UserCreatorAccess[]
+  ownedCreators       Creator[]                @relation("CreatorOwner")
+  invitations         Invitation[]             @relation("InvitationUser")
+  invitationsSent     Invitation[]             @relation("InvitationSender")
+  auditLogs           AuditLog[]
+
+  @@index([status])
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+model RateLimit {
+  id          String @id
+  key         String @unique
+  count       Int
+  lastRequest BigInt
+
+  @@map("rate_limit")
+}
+
+// ───────────────────────────── Invitations ─────────────────────────────
+
+model Invitation {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation("InvitationUser", fields: [userId], references: [id], onDelete: Cascade)
+  email       String
+  // SHA-256 of the random token. The raw token only ever exists in the emailed link.
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  createdById String?
+  createdBy   User?     @relation("InvitationSender", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@map("invitation")
+}
+
+// ───────────────────────────── RBAC ─────────────────────────────
+
+model Role {
+  id              String   @id @default(cuid())
+  key             String   @unique
+  name            String
+  description     String?
+  isSystem        Boolean  @default(false)
+  // Data scope granted by the role. Effective scope is the union across a user's roles,
+  // then adjusted by per-user overrides.
+  allAdAccounts   Boolean  @default(false)
+  allCreators     Boolean  @default(false)
+  maxLookbackDays Int?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  permissions RolePermission[]
+  metrics     RoleMetric[]
+  users       UserRole[]
+
+  @@map("role")
+}
+
+model Permission {
+  key         String  @id
+  label       String
+  description String?
+  category    String
+
+  roles         RolePermission[]
+  userOverrides UserPermissionOverride[]
+
+  @@map("permission")
+}
+
+model UserRole {
+  userId     String
+  roleId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role       Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  assignedAt DateTime @default(now())
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_role")
+}
+
+model RolePermission {
+  roleId        String
+  permissionKey String
+  role          Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission    Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@id([roleId, permissionKey])
+  @@map("role_permission")
+}
+
+model UserPermissionOverride {
+  userId        String
+  permissionKey String
+  granted       Boolean
+  user          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission    Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@id([userId, permissionKey])
+  @@map("user_permission_override")
+}
+
+enum MetricCategory {
+  DELIVERY
+  CONVERSION
+  VIDEO
+  ENGAGEMENT
+}
+
+enum MetricUnit {
+  CURRENCY
+  COUNT
+  PERCENT
+  RATIO
+  SECONDS
+}
+
+// Catalogue row for every metric the portal can show. Seeded from src/lib/metrics/catalog.ts;
+// `isSupported` is flipped off by the sync engine when Meta rejects the underlying field.
+model MetricDefinition {
+  key               String         @id
+  label             String
+  description       String
+  formula           String?
+  category          MetricCategory
+  unit              MetricUnit
+  isSensitive       Boolean        @default(false)
+  isSupported       Boolean        @default(true)
+  unsupportedReason String?
+  higherIsBetter    Boolean        @default(true)
+  sortOrder         Int            @default(0)
+
+  roles         RoleMetric[]
+  userOverrides UserMetricOverride[]
+
+  @@map("metric_definition")
+}
+
+model RoleMetric {
+  roleId    String
+  metricKey String
+  role      Role             @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  metric    MetricDefinition @relation(fields: [metricKey], references: [key], onDelete: Cascade)
+
+  @@id([roleId, metricKey])
+  @@map("role_metric")
+}
+
+model UserMetricOverride {
+  userId    String
+  metricKey String
+  granted   Boolean
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  metric    MetricDefinition @relation(fields: [metricKey], references: [key], onDelete: Cascade)
+
+  @@id([userId, metricKey])
+  @@map("user_metric_override")
+}
+
+model UserAdAccountAccess {
+  userId      String
+  adAccountId String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  adAccount   AdAccount @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  grantedAt   DateTime  @default(now())
+
+  @@id([userId, adAccountId])
+  @@index([adAccountId])
+  @@map("user_ad_account_access")
+}
+
+model UserCreatorAccess {
+  userId    String
+  creatorId String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creator   Creator  @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  grantedAt DateTime @default(now())
+
+  @@id([userId, creatorId])
+  @@index([creatorId])
+  @@map("user_creator_access")
+}
+
+// ───────────────────────────── Meta connections & entities ─────────────────────────────
+
+enum MetaAuthType {
+  SYSTEM_USER_TOKEN
+  OAUTH_USER_TOKEN
+}
+
+enum ConnectionStatus {
+  ACTIVE
+  EXPIRED
+  INVALID
+  ERROR
+  DISCONNECTED
+}
+
+model MetaConnection {
+  id                  String           @id @default(cuid())
+  label               String
+  authType            MetaAuthType
+  // AES-256-GCM ciphertext ("v1:<iv>:<tag>:<ciphertext>", base64). Never selected into API responses.
+  encryptedToken      String
+  metaUserId          String?
+  metaUserName        String?
+  scopes              String[]
+  tokenExpiresAt      DateTime?
+  dataAccessExpiresAt DateTime?
+  status              ConnectionStatus @default(ACTIVE)
+  lastValidatedAt     DateTime?
+  lastError           String?
+  isDemo              Boolean          @default(false)
+  createdById         String?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  adAccounts AdAccount[]
+
+  @@map("meta_connection")
+}
+
+enum SyncHealth {
+  OK
+  DEGRADED
+  FAILING
+  NEVER_SYNCED
+}
+
+model AdAccount {
+  id                   String     @id @default(cuid())
+  metaAccountId        String     @unique // "act_<id>"
+  name                 String
+  currency             String
+  timezoneName         String
+  accountStatus        Int?
+  businessId           String?
+  businessName         String?
+  connectionId         String?
+  connection           MetaConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+  syncEnabled          Boolean    @default(false)
+  isDemo               Boolean    @default(false)
+  historyStartDate     DateTime?  @db.Date
+  backfillQueuedAt     DateTime?
+  lastStructureSyncAt  DateTime?
+  lastInsightsSyncAt   DateTime?
+  lastSuccessfulSyncAt DateTime?
+  lastAttributionRefreshAt DateTime?
+  syncHealth           SyncHealth @default(NEVER_SYNCED)
+  lastSyncError        String?
+  rateLimitedUntil     DateTime?
+  rateLimitState       Json?
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @updatedAt
+
+  campaigns       Campaign[]
+  adSets          AdSet[]
+  ads             Ad[]
+  creatives       AdCreative[]
+  insights        AdInsightDaily[]
+  breakdowns      AdInsightBreakdownDaily[]
+  syncJobs        SyncJob[]
+  userAccess      UserAdAccountAccess[]
+
+  @@index([isDemo, syncEnabled])
+  @@map("ad_account")
+}
+
+model Campaign {
+  id              String    @id @default(cuid())
+  metaCampaignId  String    @unique
+  adAccountId     String
+  adAccount       AdAccount @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  name            String
+  objective       String?
+  status          String?
+  effectiveStatus String?
+  buyingType      String?
+  dailyBudget     Decimal?  @db.Decimal(18, 4)
+  lifetimeBudget  Decimal?  @db.Decimal(18, 4)
+  startTime       DateTime?
+  stopTime        DateTime?
+  metaCreatedTime DateTime?
+  metaUpdatedTime DateTime?
+  firstSeenAt     DateTime  @default(now())
+  lastSeenAt      DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  adSets   AdSet[]
+  ads      Ad[]
+  insights AdInsightDaily[]
+
+  @@index([adAccountId])
+  @@index([name])
+  @@map("campaign")
+}
+
+model AdSet {
+  id               String    @id @default(cuid())
+  metaAdSetId      String    @unique
+  adAccountId      String
+  adAccount        AdAccount @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  campaignId       String
+  campaign         Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  name             String
+  status           String?
+  effectiveStatus  String?
+  optimizationGoal String?
+  billingEvent     String?
+  bidStrategy      String?
+  destinationType  String?
+  dailyBudget      Decimal?  @db.Decimal(18, 4)
+  lifetimeBudget   Decimal?  @db.Decimal(18, 4)
+  attributionSpec  Json?
+  promotedObject   Json?
+  startTime        DateTime?
+  endTime          DateTime?
+  metaCreatedTime  DateTime?
+  metaUpdatedTime  DateTime?
+  firstSeenAt      DateTime  @default(now())
+  lastSeenAt       DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  ads      Ad[]
+  insights AdInsightDaily[]
+
+  @@index([adAccountId])
+  @@index([campaignId])
+  @@map("ad_set")
+}
+
+enum CreativeType {
+  VIDEO
+  IMAGE
+  CAROUSEL
+  OTHER
+  UNKNOWN
+}
+
+model AdCreative {
+  id                     String       @id @default(cuid())
+  metaCreativeId         String       @unique
+  adAccountId            String
+  adAccount              AdAccount    @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  name                   String?
+  title                  String?
+  body                   String?
+  objectType             String?
+  creativeType           CreativeType @default(UNKNOWN)
+  // Meta CDN URLs are signed and expire; they are refreshed on every structure sync.
+  thumbnailUrl           String?
+  imageUrl               String?
+  videoId                String?
+  effectiveObjectStoryId String?
+  instagramPermalinkUrl  String?
+  fetchedAt              DateTime     @default(now())
+
+  ads Ad[]
+
+  @@index([adAccountId])
+  @@map("ad_creative")
+}
+
+model Ad {
+  id                   String      @id @default(cuid())
+  metaAdId             String      @unique
+  adAccountId          String
+  adAccount            AdAccount   @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  campaignId           String
+  campaign             Campaign    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  adSetId              String
+  adSet                AdSet       @relation(fields: [adSetId], references: [id], onDelete: Cascade)
+  name                 String
+  status               String?
+  effectiveStatus      String?
+  metaCreativeId       String?
+  creativeId           String?
+  creative             AdCreative? @relation(fields: [creativeId], references: [id], onDelete: SetNull)
+  previewShareableLink String?
+  metaCreatedTime      DateTime?
+  metaUpdatedTime      DateTime?
+  firstSeenAt          DateTime    @default(now())
+  lastSeenAt           DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+
+  mapping        AdCreatorMapping?
+  mappingChanges MappingChange[]
+  insights       AdInsightDaily[]
+  breakdowns     AdInsightBreakdownDaily[]
+
+  @@index([adAccountId])
+  @@index([campaignId])
+  @@index([adSetId])
+  @@index([name])
+  @@map("ad")
+}
+
+// ───────────────────────────── Creators & mapping ─────────────────────────────
+
+model Creator {
+  id              String   @id @default(cuid())
+  code            String   @unique // human-facing "Creator ID", e.g. CR014 — used by naming rules
+  name            String
+  instagramHandle String?  @unique
+  profileImageUrl String?
+  notes           String?
+  isActive        Boolean  @default(true)
+  team            String?
+  ownerUserId     String?
+  owner           User?    @relation("CreatorOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  assets     CreativeAsset[]
+  mappings   AdCreatorMapping[]
+  userAccess UserCreatorAccess[]
+
+  @@index([name])
+  @@map("creator")
+}
+
+model CreativeAsset {
+  id           String       @id @default(cuid())
+  creatorId    String
+  creator      Creator      @relation(fields: [creatorId], references: [id], onDelete: Restrict)
+  title        String
+  creativeType CreativeType @default(UNKNOWN)
+  contentAngle String?
+  hook         String?
+  product      String?
+  tags         String[]
+  launchDate   DateTime?    @db.Date
+  notes        String?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  mappings AdCreatorMapping[]
+
+  @@index([creatorId])
+  @@index([product])
+  @@map("creative_asset")
+}
+
+enum MappingMethod {
+  MANUAL
+  BULK
+  NAMING_RULE
+}
+
+// Exactly one creator per ad (unique adId) — this is what prevents double counting in rankings.
+model AdCreatorMapping {
+  id              String         @id @default(cuid())
+  adId            String         @unique
+  ad              Ad             @relation(fields: [adId], references: [id], onDelete: Cascade)
+  creatorId       String
+  creator         Creator        @relation(fields: [creatorId], references: [id], onDelete: Restrict)
+  creativeAssetId String?
+  creativeAsset   CreativeAsset? @relation(fields: [creativeAssetId], references: [id], onDelete: SetNull)
+  method          MappingMethod
+  namingRuleId    String?
+  mappedById      String?
+  notes           String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([creatorId])
+  @@index([creativeAssetId])
+  @@map("ad_creator_mapping")
+}
+
+model MappingChange {
+  id                String        @id @default(cuid())
+  adId              String
+  ad                Ad            @relation(fields: [adId], references: [id], onDelete: Cascade)
+  previousCreatorId String?
+  newCreatorId      String?
+  previousAssetId   String?
+  newAssetId        String?
+  method            MappingMethod
+  changedById       String?
+  reason            String?
+  createdAt         DateTime      @default(now())
+
+  @@index([adId, createdAt])
+  @@map("mapping_change")
+}
+
+enum NamingSource {
+  AD_NAME
+  ADSET_NAME
+  CAMPAIGN_NAME
+}
+
+enum NamingMatchField {
+  CREATOR_CODE
+  INSTAGRAM_HANDLE
+}
+
+// Token-based naming convention rule (no user-supplied regex, so no ReDoS surface).
+// Example: source AD_NAME, prefix "CR-", matchField CREATOR_CODE matches "Summer_CR-CR014_Hook2".
+model NamingRule {
+  id         String           @id @default(cuid())
+  name       String
+  source     NamingSource
+  matchField NamingMatchField
+  prefix     String           @default("")
+  priority   Int              @default(100)
+  enabled    Boolean          @default(true)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  @@map("naming_rule")
+}
+
+// ───────────────────────────── Insights ─────────────────────────────
+
+// One row per ad per day (ad-account time zone), as reported by Meta with each ad set's
+// attribution setting (use_unified_attribution_setting=true). Re-fetched for recent days to
+// pick up attribution updates; changed rows bump `revision` and the prior values are kept in
+// AdInsightRevision.
+model AdInsightDaily {
+  id          BigInt    @id @default(autoincrement())
+  adId        String
+  ad          Ad        @relation(fields: [adId], references: [id], onDelete: Cascade)
+  adAccountId String
+  adAccount   AdAccount @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  campaignId  String
+  campaign    Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  adSetId     String
+  adSet       AdSet     @relation(fields: [adSetId], references: [id], onDelete: Cascade)
+  date        DateTime  @db.Date
+  currency    String    @db.VarChar(3)
+
+  spend            Decimal  @db.Decimal(18, 4)
+  impressions      BigInt
+  reach            BigInt?
+  clicks           BigInt?
+  linkClicks       BigInt?
+  outboundClicks   BigInt?
+  landingPageViews Decimal? @db.Decimal(18, 4)
+
+  purchases            Decimal? @db.Decimal(18, 4)
+  purchaseValue        Decimal? @db.Decimal(18, 4)
+  websitePurchases     Decimal? @db.Decimal(18, 4)
+  websitePurchaseValue Decimal? @db.Decimal(18, 4)
+  addToCart            Decimal? @db.Decimal(18, 4)
+  initiateCheckout     Decimal? @db.Decimal(18, 4)
+  viewContent          Decimal? @db.Decimal(18, 4)
+  leads                Decimal? @db.Decimal(18, 4)
+  completeRegistration Decimal? @db.Decimal(18, 4)
+
+  videoPlays      Decimal? @db.Decimal(18, 4) // video_play_actions
+  video3sViews    Decimal? @db.Decimal(18, 4) // actions[video_view]
+  thruplays       Decimal? @db.Decimal(18, 4)
+  videoP25        Decimal? @db.Decimal(18, 4)
+  videoP50        Decimal? @db.Decimal(18, 4)
+  videoP75        Decimal? @db.Decimal(18, 4)
+  videoP95        Decimal? @db.Decimal(18, 4)
+  videoP100       Decimal? @db.Decimal(18, 4)
+  videoAvgTimeSec Decimal? @db.Decimal(18, 4)
+
+  postEngagement Decimal? @db.Decimal(18, 4)
+  postReactions  Decimal? @db.Decimal(18, 4)
+  postComments   Decimal? @db.Decimal(18, 4)
+  postShares     Decimal? @db.Decimal(18, 4)
+  postSaves      Decimal? @db.Decimal(18, 4)
+
+  // "Results" as Meta defines them depend on each ad set's optimisation goal; we derive the
+  // count from the goal + promoted object at ingest and keep the result type alongside it.
+  results    Decimal? @db.Decimal(18, 4)
+  resultType String?
+
+  objective          String?
+  optimizationGoal   String?
+  attributionSetting String?
+
+  actionsRaw      Json?
+  actionValuesRaw Json?
+  contentHash     String
+  revision        Int      @default(1)
+  firstFetchedAt  DateTime @default(now())
+  fetchedAt       DateTime @default(now())
+
+  revisions AdInsightRevision[]
+
+  @@unique([adId, date])
+  @@index([date])
+  @@index([adAccountId, date])
+  @@index([campaignId, date])
+  @@map("ad_insight_daily")
+}
+
+model AdInsightRevision {
+  id             BigInt         @id @default(autoincrement())
+  insightId      BigInt
+  insight        AdInsightDaily @relation(fields: [insightId], references: [id], onDelete: Cascade)
+  revision       Int
+  previousValues Json
+  changedAt      DateTime       @default(now())
+
+  @@index([insightId])
+  @@map("ad_insight_revision")
+}
+
+enum BreakdownType {
+  AGE_GENDER
+  PLATFORM_POSITION
+  DEVICE_PLATFORM
+  COUNTRY
+  REGION
+}
+
+model AdInsightBreakdownDaily {
+  id            BigInt        @id @default(autoincrement())
+  adId          String
+  ad            Ad            @relation(fields: [adId], references: [id], onDelete: Cascade)
+  adAccountId   String
+  adAccount     AdAccount     @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  date          DateTime      @db.Date
+  breakdownType BreakdownType
+  dim1          String
+  dim2          String        @default("")
+  currency      String        @db.VarChar(3)
+  spend         Decimal       @db.Decimal(18, 4)
+  impressions   BigInt
+  reach         BigInt?
+  clicks        BigInt?
+  linkClicks    BigInt?
+  purchases     Decimal?      @db.Decimal(18, 4)
+  purchaseValue Decimal?      @db.Decimal(18, 4)
+  fetchedAt     DateTime      @default(now())
+
+  @@unique([adId, date, breakdownType, dim1, dim2])
+  @@index([adAccountId, breakdownType, date])
+  @@map("ad_insight_breakdown_daily")
+}
+
+// ───────────────────────────── Sync pipeline ─────────────────────────────
+
+enum SyncJobType {
+  STRUCTURE
+  INSIGHTS
+  BREAKDOWNS
+}
+
+enum SyncTrigger {
+  SCHEDULED
+  MANUAL
+  INITIAL_BACKFILL
+  ATTRIBUTION_REFRESH
+}
+
+enum SyncJobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+model SyncJob {
+  id             String        @id @default(cuid())
+  adAccountId    String
+  adAccount      AdAccount     @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  type           SyncJobType
+  trigger        SyncTrigger
+  status         SyncJobStatus @default(QUEUED)
+  priority       Int           @default(100) // lower runs first
+  dateFrom       DateTime?     @db.Date
+  dateTo         DateTime?     @db.Date
+  breakdownType  BreakdownType?
+  attempts       Int           @default(0)
+  maxAttempts    Int           @default(6)
+  runAfter       DateTime      @default(now())
+  lockedBy       String?
+  leaseExpiresAt DateTime?
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  // Resumable state, e.g. { reportRunId } for an in-flight async insights report.
+  state          Json?
+  stats          Json?
+  errorCode      String?
+  errorMessage   String?
+  // Prevents duplicate queued/running jobs for the same work (partial unique index in migration).
+  dedupeKey      String
+  requestedById  String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  events SyncJobEvent[]
+
+  @@index([status, runAfter, priority])
+  @@index([adAccountId, createdAt])
+  @@map("sync_job")
+}
+
+model SyncJobEvent {
+  id        BigInt   @id @default(autoincrement())
+  jobId     String
+  job       SyncJob  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  level     String // info | warn | error
+  message   String
+  data      Json?
+  createdAt DateTime @default(now())
+
+  @@index([jobId, createdAt])
+  @@map("sync_job_event")
+}
+
+// ───────────────────────────── Audit & settings ─────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  actorEmail String?
+  action     String
+  targetType String?
+  targetId   String?
+  summary    String
+  metadata   Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@index([targetType, targetId])
+  @@map("audit_log")
+}
+
+model AppSetting {
+  key         String   @id
+  value       Json
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  @@map("app_setting")
+}
